@@ -9,7 +9,14 @@
 
 import { fileURLToPath } from "url";
 import { join, dirname, basename, normalize } from "path";
-import { existsSync, readdirSync, mkdirSync } from "fs";
+import {
+  existsSync,
+  readdirSync,
+  mkdirSync,
+  writeFileSync,
+  copyFileSync,
+  readFileSync,
+} from "fs";
 import { spawn } from "child_process";
 import { promisify } from "util";
 import { exec } from "child_process";
@@ -748,6 +755,39 @@ class GodotServer {
             required: [],
           },
         },
+        {
+          name: "capture_screenshot",
+          description:
+            "Capture a screenshot of a Godot scene. Returns the path to the saved screenshot.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              projectPath: {
+                type: "string",
+                description: "Path to the Godot project directory",
+              },
+              scene: {
+                type: "string",
+                description:
+                  "Optional: Specific scene to capture (e.g., 'res://scenes/main.tscn'). If not provided, captures the main scene.",
+              },
+              width: {
+                type: "number",
+                description: "Viewport width in pixels (default: 1920)",
+              },
+              height: {
+                type: "number",
+                description: "Viewport height in pixels (default: 1080)",
+              },
+              delay: {
+                type: "number",
+                description:
+                  "Seconds to wait before capturing, allowing animations to settle (default: 0.5)",
+              },
+            },
+            required: ["projectPath"],
+          },
+        },
       ],
     }));
 
@@ -761,6 +801,8 @@ class GodotServer {
           return await this.handleRunProject(request.params.arguments);
         case "get_debug_output":
           return await this.handleGetDebugOutput();
+        case "capture_screenshot":
+          return await this.handleCaptureScreenshot(request.params.arguments);
         case "stop_project":
           return await this.handleStopProject();
         case "get_godot_version":
@@ -1006,6 +1048,193 @@ class GodotServer {
         },
       ],
     };
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * @param args Tool arguments
+   */
+  private async handleCaptureScreenshot(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse("Project path is required", [
+        "Provide a valid path to a Godot project directory",
+      ]);
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse("Invalid project path", [
+        'Provide a valid path without ".." or other potentially unsafe characters',
+      ]);
+    }
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            "Could not find a valid Godot executable path",
+            [
+              "Ensure Godot is installed correctly",
+              "Set GODOT_PATH environment variable to specify the correct path",
+            ],
+          );
+        }
+      }
+
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, "project.godot");
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            "Ensure the path points to a directory containing a project.godot file",
+            "Use list_projects to find valid Godot projects",
+          ],
+        );
+      }
+
+      // Ensure the screenshot capture script is installed in the project
+      const installResult = await this.ensureScreenshotScriptInstalled(
+        args.projectPath,
+      );
+      if (!installResult.success) {
+        return this.createErrorResponse(
+          `Failed to install screenshot capture script: ${installResult.error}`,
+          ["Check write permissions to the project directory"],
+        );
+      }
+
+      // Prepare config for the screenshot capture
+      const config: any = {
+        width: args.width || 1920,
+        height: args.height || 1080,
+        delay: args.delay !== undefined ? args.delay : 0.5,
+      };
+
+      // Add scene path if specified
+      if (args.scene) {
+        let scenePath = args.scene;
+        if (!scenePath.startsWith("res://")) {
+          scenePath = "res://" + scenePath;
+        }
+        config.scene = scenePath;
+      }
+
+      // Write config file to the project
+      const configPath = join(args.projectPath, ".mcp_screenshot_config.json");
+      writeFileSync(configPath, JSON.stringify(config, null, 2));
+      this.logDebug(`Screenshot config written to: ${configPath}`);
+
+      // Build command arguments
+      const cmdArgs = ["--mcp-screenshot", "--path", args.projectPath];
+
+      this.logDebug(`Running screenshot capture: ${this.godotPath} ${cmdArgs.join(" ")}`);
+
+      // Run Godot with the screenshot flag and wait for it to complete
+      const { stdout, stderr } = await execAsync(
+        `"${this.godotPath}" ${cmdArgs.join(" ")}`,
+        { timeout: 30000 }, // 30 second timeout
+      );
+
+      this.logDebug(`Screenshot stdout: ${stdout}`);
+      if (stderr) {
+        this.logDebug(`Screenshot stderr: ${stderr}`);
+      }
+
+      // Parse the output to find the screenshot path
+      const successMatch = stdout.match(/\[MCP Screenshot\] SUCCESS:(.+)/);
+      if (successMatch) {
+        const screenshotPath = successMatch[1].trim();
+        return {
+          content: [
+            {
+              type: "text",
+              text: screenshotPath,
+            },
+          ],
+        };
+      }
+
+      // If we didn't find SUCCESS, check for errors
+      return this.createErrorResponse(
+        `Screenshot capture failed. Output: ${stdout}\nErrors: ${stderr}`,
+        [
+          "Check if the scene path is valid",
+          "Ensure the project can run without errors",
+          "Try running the project manually to check for issues",
+        ],
+      );
+    } catch (error: unknown) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${errorMessage}`,
+        [
+          "Ensure Godot is installed correctly",
+          "Check if the project can run without errors",
+          "Verify the scene path is correct",
+        ],
+      );
+    }
+  }
+
+  /**
+   * Ensure the screenshot capture script is installed in the project
+   * @param projectPath Path to the Godot project
+   */
+  private async ensureScreenshotScriptInstalled(
+    projectPath: string,
+  ): Promise<{ success: boolean; error?: string }> {
+    const targetDir = join(projectPath, "addons", "godot_mcp");
+    const targetScript = join(targetDir, "screenshot_capture.gd");
+    const sourceScript = join(__dirname, "scripts", "screenshot_capture.gd");
+
+    try {
+      // Create addons/godot_mcp directory if it doesn't exist
+      if (!existsSync(targetDir)) {
+        mkdirSync(targetDir, { recursive: true });
+      }
+
+      // Copy the screenshot script if it doesn't exist or is outdated
+      if (!existsSync(targetScript)) {
+        copyFileSync(sourceScript, targetScript);
+        this.logDebug(`Installed screenshot script to: ${targetScript}`);
+      }
+
+      // Ensure the autoload is registered in project.godot
+      const projectFile = join(projectPath, "project.godot");
+      let projectContent = readFileSync(projectFile, "utf8");
+
+      const autoloadName = "MCPScreenshot";
+      const autoloadPath = "res://addons/godot_mcp/screenshot_capture.gd";
+      const autoloadEntry = `${autoloadName}="*${autoloadPath}"`;
+
+      // Check if autoload section exists and if our autoload is registered
+      if (!projectContent.includes(autoloadEntry)) {
+        if (projectContent.includes("[autoload]")) {
+          // Add to existing autoload section
+          projectContent = projectContent.replace(
+            "[autoload]",
+            `[autoload]\n\n${autoloadEntry}`,
+          );
+        } else {
+          // Create autoload section
+          projectContent += `\n[autoload]\n\n${autoloadEntry}\n`;
+        }
+        writeFileSync(projectFile, projectContent);
+        this.logDebug(`Registered screenshot autoload in project.godot`);
+      }
+
+      return { success: true };
+    } catch (error: unknown) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      return { success: false, error: errorMessage };
+    }
   }
 
   /**
@@ -1274,8 +1503,7 @@ class GodotServer {
       // Extract project name from project.godot file
       let projectName = basename(args.projectPath);
       try {
-        const fs = require("fs");
-        const projectFileContent = fs.readFileSync(projectFile, "utf8");
+        const projectFileContent = readFileSync(projectFile, "utf8");
         const configNameMatch = projectFileContent.match(
           /config\/name="([^"]+)"/,
         );
